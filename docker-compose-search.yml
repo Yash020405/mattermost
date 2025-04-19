@@ -1,0 +1,131 @@
+version: '3.8'
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:7.17.7
+    container_name: mattermost-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    networks:
+      - mattermost-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:7.17.7
+    container_name: mattermost-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    networks:
+      - mattermost-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:13-alpine
+    container_name: mattermost-postgres
+    environment:
+      - POSTGRES_USER=mmuser
+      - POSTGRES_PASSWORD=mmuser_password
+      - POSTGRES_DB=mattermost
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - mattermost-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mmuser"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  mattermost:
+    image: mattermost/mattermost-enterprise-edition:7.8
+    container_name: mattermost-server
+    environment:
+      - MM_SQLSETTINGS_DRIVERNAME=postgres
+      - MM_SQLSETTINGS_DATASOURCE=postgres://mmuser:mmuser_password@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      - MM_ELASTICSEARCHSETTINGS_CONNECTIONURL=http://elasticsearch:9200
+      - MM_ELASTICSEARCHSETTINGS_USERNAME=
+      - MM_ELASTICSEARCHSETTINGS_PASSWORD=
+      - MM_ELASTICSEARCHSETTINGS_ENABLEINDEXING=true
+      - MM_ELASTICSEARCHSETTINGS_ENABLESEARCHING=true
+      - MM_ELASTICSEARCHSETTINGS_ENABLEAUTOCOMPLETE=true
+      - MM_ELASTICSEARCHSETTINGS_SNIFF=false
+      - MM_ELASTICSEARCHSETTINGS_POSTINDEXREPLICAS=0
+      - MM_ELASTICSEARCHSETTINGS_POSTINDEXSHARDS=1
+      - MM_ELASTICSEARCHSETTINGS_CHANNELINDEXREPLICAS=0
+      - MM_ELASTICSEARCHSETTINGS_CHANNELINDEXSHARDS=1
+      - MM_ELASTICSEARCHSETTINGS_USERINDEXREPLICAS=0
+      - MM_ELASTICSEARCHSETTINGS_USERINDEXSHARDS=1
+      - MM_ELASTICSEARCHSETTINGS_INDEXPREFIX=mattermost
+      - MM_ELASTICSEARCHSETTINGS_LIVEINDEXINGBATCHSIZE=1000
+      - MM_ELASTICSEARCHSETTINGS_BULKINDEXINGTIMEWINDOWSECONDS=3600
+      - MM_ELASTICSEARCHSETTINGS_REQUESTTIMEOUTSECONDS=30
+    volumes:
+      - mattermost-data:/mattermost/data
+      - mattermost-logs:/mattermost/logs
+      - mattermost-config:/mattermost/config
+      - mattermost-plugins:/mattermost/plugins
+      - mattermost-client-plugins:/mattermost/client/plugins
+      - ./server/platform/services/searchengine/scripts:/mattermost/scripts
+    ports:
+      - "8065:8065"
+    networks:
+      - mattermost-network
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # Data generator tool for benchmarking
+  data-generator:
+    build:
+      context: ./server/platform/services/searchengine/bench
+      dockerfile: Dockerfile.bench
+    container_name: mattermost-data-generator
+    environment:
+      - MM_URL=http://mattermost:8065
+      - MM_ADMIN_USERNAME=admin
+      - MM_ADMIN_PASSWORD=admin
+      - ES_URL=http://elasticsearch:9200
+    volumes:
+      - ./server/platform/services/searchengine/bench:/app/bench
+    networks:
+      - mattermost-network
+    depends_on:
+      - mattermost
+      - elasticsearch
+
+networks:
+  mattermost-network:
+    driver: bridge
+
+volumes:
+  es-data:
+  pg-data:
+  mattermost-data:
+  mattermost-logs:
+  mattermost-config:
+  mattermost-plugins:
+  mattermost-client-plugins: 

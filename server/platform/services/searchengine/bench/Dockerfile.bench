@@ -1,0 +1,26 @@
+FROM golang:1.19-alpine
+
+WORKDIR /app
+
+# Install build dependencies
+RUN apk add --no-cache git build-base
+
+# Copy go.mod and go.sum first for better caching
+COPY go.mod go.sum /app/
+RUN go mod download
+
+# Copy the benchmark code
+COPY server/platform/services/searchengine/bench /app/bench/
+
+# Build the benchmark tool
+RUN cd /app/bench && go build -o search_benchmark benchmark_cmd.go
+
+# Set the working directory to the benchmark directory
+WORKDIR /app/bench
+
+# Make the script executable
+RUN chmod +x search_benchmark
+
+# Set the default command to run the benchmark
+ENTRYPOINT ["./search_benchmark"]
+CMD ["-es-url", "http://elasticsearch:9200", "-posts", "10000", "-users", "100", "-channels", "10"] 
