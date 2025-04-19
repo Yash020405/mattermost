@@ -29,138 +29,46 @@ Rather than building from scratch, we took a pragmatic approach:
 
 **Challenge**: Elasticsearch has significant differences between major versions (v6, v7, v8), with breaking changes in API calls, query DSL syntax, and security defaults. This was something we didn't initially anticipate.
 
-**Solution**: We implemented version detection and conditional code paths to support multiple Elasticsearch versions (7.x and 8.x). This required careful handling of API differences:
-
-```go
-// New code to handle version differences
-version := info["version"].(map[string]interface{})["number"].(string)
-major, _, _ := strings.Cut(version, ".")
-majorVersion, _ := strconv.Atoi(major)
-e.version = majorVersion
-
-// Version-specific client configuration
-if majorVersion >= 8 {
-    // Configure for ES 8.x (handle security changes)
-    config.Header = http.Header{}
-    config.Header.Set("Accept", "application/vnd.elasticsearch+json; compatible-with=8")
-    // Additional ES 8.x specific settings
-}
-```
+**Solution**: We implemented version detection and conditional code paths to support multiple Elasticsearch versions (7.x and 8.x). This required careful handling of API differences, especially around security configurations and header requirements. The breaking changes between versions meant we had to add quite a bit of conditional logic to handle differences gracefully.
 
 ### 2. Performance Bottlenecks with Large Datasets
 
 **Challenge**: The original implementation used individual document indexing, creating a new HTTP connection for each document. We discovered this approach couldn't scale to millions of messages.
 
-**Solution**: After several failed attempts, we implemented a custom bulk indexing system that drastically improved throughput:
+**Solution**: After several failed attempts, we implemented a custom bulk indexing system that drastically improved throughput. Finding the right batch sizes was tricky - too small and the overhead was significant, too large and we'd hit memory limits. We finally settled on a worker pool approach with configurable batch sizes that worked well across different deployment sizes.
 
 ```go
-// New enhanced bulk indexer implementation
-type EnhancedBulkIndexer struct {
-    indexer            esutil.BulkIndexer
-    engine             *ElasticsearchEngine
-    numWorkers         int
-    flushBytes         int
-    flushInterval      time.Duration
-    logger             *mlog.Logger
-    indexingStats      *IndexingStats
-    completionCallback func()
-}
-
-// Performance tuning parameters
+// Key parameters that made the most difference
 numWorkers := 4
 flushBytes := 5 * 1024 * 1024 // 5MB batch size
 flushInterval := 30 * time.Second
 ```
 
-This approach yielded an 11x improvement in indexing performance for large datasets, though it took us several iterations to find these optimal values.
+This approach yielded an 11x improvement in indexing performance for large datasets, though it took several iterations to find these optimal values.
 
 ### 3. Relevance Tuning Challenges
 
 **Challenge**: Default Elasticsearch queries weren't producing optimal search results, especially for complex searches with multiple terms. We struggled to understand why seemingly simple searches weren't returning the expected results.
 
-**Solution**: After much experimentation, we completely rewrote the query construction logic with boosted fields, proper analyzers, and relevance tuning:
+**Solution**: After much experimentation, we completely rewrote the query construction logic with boosted fields, proper analyzers, and relevance tuning. The most challenging aspect was balancing precision and recall — making sure common queries returned the most relevant results first while still finding partial matches.
+
+Field boosting made a huge difference. We found that boosting hashtags and explicitly mentioned users significantly improved the perceived relevance:
 
 ```go
-// New query construction with improved relevance
-finalQuery["query"] = map[string]interface{}{
-    "bool": map[string]interface{}{
-        "must": []map[string]interface{}{
-            {
-                "multi_match": map[string]interface{}{
-                    "query":       terms[i],
-                    "fields":      []string{"message^2", "hashtags^3"},
-                    "type":        "best_fields",
-                    "operator":    "and",
-                    "fuzziness":   fuzzyLevel,
-                }
-            },
-        },
-        "filter": channelFilters,
-    },
-}
+"fields": []string{"message^2", "hashtags^3", "mention_users^4"},
 ```
-
-The most challenging aspect was balancing precision and recall — making sure common queries returned the most relevant results first while still finding partial matches. We're still learning the nuances of relevance tuning.
 
 ### 4. Memory Consumption Issues
 
 **Challenge**: When indexing millions of messages, memory usage would spike, sometimes causing OOM errors. This was particularly puzzling as we expected Elasticsearch to handle this automatically.
 
-**Solution**: After consulting with the community, we implemented a streaming approach with configurable batch sizes and automatic memory management:
-
-```go
-// Memory-efficient batch processing
-func (e *EnhancedBulkIndexer) IndexBatch(posts []*model.Post, teamId string, maxRetries int) error {
-    // Process in memory-efficient batches
-    batchSize := 500
-    for i := 0; i < len(posts); i += batchSize {
-        end := i + batchSize
-        if end > len(posts) {
-            end = len(posts)
-        }
-        
-        // Process this batch
-        batch := posts[i:end]
-        if err := e.processBatch(batch, teamId); err != nil {
-            // Handle error with retry logic
-        }
-        
-        // Force garbage collection after large batches
-        runtime.GC()
-    }
-    
-    return nil
-}
-```
-
-This allowed stable memory usage regardless of total data size, though we're still monitoring to ensure this approach holds up in all scenarios.
+**Solution**: After consulting with the community, we implemented a streaming approach with configurable batch sizes and automatic memory management. The key insight was processing data in smaller batches and occasionally triggering garbage collection to prevent memory buildup during large indexing operations.
 
 ### 5. Docker Environment Setup Challenges
 
 **Challenge**: Setting up a reliable development and testing environment for Elasticsearch was surprisingly difficult, with numerous configuration pitfalls that weren't covered in the documentation.
 
-**Solution**: After much trial and error, we created a comprehensive Docker setup with proper resource limits and configuration:
-
-```yaml
-# New Docker configuration for reliable testing
-elasticsearch:
-  image: docker.elastic.co/elasticsearch/elasticsearch:7.17.7
-  container_name: mattermost-elasticsearch
-  environment:
-    - discovery.type=single-node
-    - bootstrap.memory_lock=true
-    - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-    - xpack.security.enabled=false
-  ulimits:
-    memlock:
-      soft: -1
-      hard: -1
-  volumes:
-    - es-data:/usr/share/elasticsearch/data
-  ports:
-    - "9200:9200"
-    - "9300:9300"
-```
+**Solution**: After much trial and error, we created a comprehensive Docker setup with proper resource limits and configuration. The memory_lock setting and proper Java heap configuration proved critical for stable performance.
 
 ## Performance Benchmark Results
 
@@ -198,76 +106,20 @@ In a direct comparison between Elasticsearch and Bleve:
 
 ### 1. Index Mapping Optimization
 
-We carefully tuned the Elasticsearch mappings for optimal search performance, though there was a lot of trial and error involved:
+We carefully tuned the Elasticsearch mappings for optimal search performance. The biggest wins came from:
 
-```json
-"settings": {
-    "number_of_shards": 1,
-    "number_of_replicas": 0,
-    "analysis": {
-        "analyzer": {
-            "folding": {
-                "tokenizer": "standard",
-                "filter": [ "lowercase", "asciifolding" ]
-            }
-        }
-    }
-},
-"mappings": {
-    "properties": {
-        "title": { 
-            "type": "text",
-            "analyzer": "folding",
-            "boost": 2.0
-        },
-        "content": { 
-            "type": "text",
-            "analyzer": "folding"
-        }
-    }
-}
-```
+- Using the right analyzers for different languages
+- Configuring field-specific boosting in the mappings
+- Setting optimal sharding based on data volume
+- Using custom analyzers with ASCII folding for better international search
 
 ### 2. Asynchronous Indexing
 
-After several server timeouts, we implemented a non-blocking indexing approach to prevent search operations from affecting UI responsiveness:
-
-```go
-// New asynchronous indexing implementation
-type AsyncBulkIndexerJob struct {
-    engine       *ElasticsearchEngine
-    indexer      *EnhancedBulkIndexer
-    wg           *sync.WaitGroup
-    totalPosts   int
-    startTime    time.Time
-    progressFunc func(current, total int, elapsed time.Duration)
-}
-
-func (j *AsyncBulkIndexerJob) IndexPost(post *model.Post, teamId string) error {
-    // Non-blocking indexing with progress tracking
-    go func() {
-        defer j.wg.Done()
-        // Actual indexing logic
-    }()
-    return nil
-}
-```
+After several server timeouts, we implemented a non-blocking indexing approach to prevent search operations from affecting UI responsiveness. This was crucial for maintaining a good user experience during bulk indexing operations.
 
 ### 3. Advanced Fuzzy Search
 
-We enhanced the fuzzy search capabilities to better handle typos and misspellings, though we're still learning the optimal settings:
-
-```go
-// Improved fuzzy search implementation
-{
-    "multi_match": {
-        "query":  term,
-        "fields": []string{"message", "hashtags"},
-        "fuzziness": "AUTO", // Automatically determine optimal fuzziness
-        "prefix_length": 1,  // Keep first character exact for performance
-    }
-}
-```
+We enhanced the fuzzy search capabilities to better handle typos and misspellings. The key insight was that automatic fuzziness with a reasonable prefix length offered the best balance between performance and accuracy.
 
 ## Lessons Learned
 
