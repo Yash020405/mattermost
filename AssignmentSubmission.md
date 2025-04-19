@@ -2,140 +2,141 @@
 
 ## The Challenge
 
-When we started this project, we faced the complex task of extending Mattermost's search capabilities to handle enterprise-scale data volumes. The existing implementation primarily relied on database queries and the Bleve search engine, which struggled with:
+When we started this project, we faced the challenge of improving Mattermost's search capabilities for larger data volumes. The existing implementation primarily relied on database queries and the Bleve search engine, which had some limitations:
 
-- Search performance degradation with large datasets (millions of messages)
-- Limited relevance ranking for complex queries
-- Poor multilingual search capabilities
-- Challenges with fuzzy searching and typo tolerance
+- Slower search performance with larger datasets
+- Basic relevance ranking for queries
+- Limited support for multilingual content
+- Difficulty handling typos and misspellings
 
-Our goal was to implement a solution that would maintain high performance even as message volume grew exponentially, while delivering the search quality expected in modern enterprise applications.
+Our goal was to explore how Elasticsearch could enhance these capabilities while providing reasonable performance improvements.
 
 ## Our Approach
 
-Rather than building from scratch, we took a pragmatic approach:
+We took a practical approach to implementation:
 
-1. **Deep dive into existing architecture**: We spent significant time understanding Mattermost's search infrastructure, particularly the SearchEngine interface and existing implementations.
+1. **Understanding the existing architecture**: We spent time learning Mattermost's search infrastructure, including the SearchEngine interface and how the current implementations worked.
 
-2. **Leverage Elasticsearch strengths**: We identified areas where Elasticsearch's capabilities could be best leveraged, such as advanced text analysis, distributed indexing, and complex query construction.
+2. **Identifying Elasticsearch advantages**: We looked for areas where Elasticsearch could potentially improve the current system, particularly in text analysis and query construction.
 
-3. **Benchmark-driven development**: We created comprehensive benchmarks to quantify improvements and guide optimization decisions.
+3. **Creating benchmark tests**: We built some basic benchmarks to help measure the impact of our changes.
 
-4. **User-centric optimizations**: We focused on optimizations that would most impact end-user experience, like search relevance and query performance.
+4. **Focusing on user experience**: We prioritized improvements that users would actually notice, like search quality and response times.
 
 ## Implementation Challenges & Solutions
 
-### 1. Wrestling with Elasticsearch Version Compatibility
+### 1. Elasticsearch Version Compatibility
 
-**Challenge**: Elasticsearch has significant differences between major versions (v6, v7, v8), with breaking changes in API calls, query DSL syntax, and security defaults. This was something we didn't initially anticipate.
+**Challenge**: Different Elasticsearch versions (v6, v7, v8) have varying APIs and requirements, which complicated implementation.
 
-**Solution**: We implemented version detection and conditional code paths to support multiple Elasticsearch versions (7.x and 8.x). This required careful handling of API differences, especially around security configurations and header requirements. The breaking changes between versions meant we had to add quite a bit of conditional logic to handle differences gracefully.
+**Solution**: We added version detection logic to support Elasticsearch 7.x and 8.x, with conditional code to handle the major differences. This wasn't elegant, but it allowed the system to work with different versions that users might have installed.
 
-### 2. Performance Bottlenecks with Large Datasets
+### 2. Performance with Larger Datasets
 
-**Challenge**: The original implementation used individual document indexing, creating a new HTTP connection for each document. We discovered this approach couldn't scale to millions of messages.
+**Challenge**: The original implementation indexed documents individually, which was inefficient for larger message volumes.
 
-**Solution**: After several failed attempts, we implemented a custom bulk indexing system that drastically improved throughput. Finding the right batch sizes was tricky - too small and the overhead was significant, too large and we'd hit memory limits. We finally settled on a worker pool approach with configurable batch sizes that worked well across different deployment sizes.
+**Solution**: We implemented a basic bulk indexing approach that improved throughput. After some experimentation, we found settings that worked reasonably well for our test datasets:
 
 ```go
-// Key parameters that made the most difference
+// Parameters that seemed to work well in our testing
 numWorkers := 4
 flushBytes := 5 * 1024 * 1024 // 5MB batch size
 flushInterval := 30 * time.Second
 ```
 
-This approach yielded an 11x improvement in indexing performance for large datasets, though it took several iterations to find these optimal values.
+This approach improved indexing performance for our test datasets, though real-world performance would vary based on server resources and data characteristics.
 
-### 3. Relevance Tuning Challenges
+### 3. Search Relevance Improvements
 
-**Challenge**: Default Elasticsearch queries weren't producing optimal search results, especially for complex searches with multiple terms. We struggled to understand why seemingly simple searches weren't returning the expected results.
+**Challenge**: Default Elasticsearch queries didn't always return the most relevant results first.
 
-**Solution**: After much experimentation, we completely rewrote the query construction logic with boosted fields, proper analyzers, and relevance tuning. The most challenging aspect was balancing precision and recall — making sure common queries returned the most relevant results first while still finding partial matches.
-
-Field boosting made a huge difference. We found that boosting hashtags and explicitly mentioned users significantly improved the perceived relevance:
+**Solution**: We experimented with field boosting and query construction to improve result ordering. Simple boosting of important fields made a noticeable difference:
 
 ```go
-"fields": []string{"message^2", "hashtags^3", "mention_users^4"},
+"fields": []string{"message^2", "hashtags^3"},
 ```
 
-### 4. Memory Consumption Issues
+While our solution isn't perfect, it generally returns more relevant results than the basic implementation.
 
-**Challenge**: When indexing millions of messages, memory usage would spike, sometimes causing OOM errors. This was particularly puzzling as we expected Elasticsearch to handle this automatically.
+### 4. Memory Usage During Indexing
 
-**Solution**: After consulting with the community, we implemented a streaming approach with configurable batch sizes and automatic memory management. The key insight was processing data in smaller batches and occasionally triggering garbage collection to prevent memory buildup during large indexing operations.
+**Challenge**: When indexing many messages at once, memory usage would sometimes spike unexpectedly.
 
-### 5. Docker Environment Setup Challenges
+**Solution**: We implemented batch processing with smaller batch sizes to keep memory usage more consistent. This approach worked for our test datasets, though very large installations might need additional optimization.
 
-**Challenge**: Setting up a reliable development and testing environment for Elasticsearch was surprisingly difficult, with numerous configuration pitfalls that weren't covered in the documentation.
+### 5. Development Environment Setup
 
-**Solution**: After much trial and error, we created a comprehensive Docker setup with proper resource limits and configuration. The memory_lock setting and proper Java heap configuration proved critical for stable performance.
+**Challenge**: Setting up Elasticsearch for development and testing was more complicated than expected.
 
-## Performance Benchmark Results
+**Solution**: We created a simple Docker configuration that worked for our development needs, though production deployments would require more careful configuration.
 
-We created a comprehensive benchmarking tool to measure real-world performance. The results exceeded our expectations:
+## Performance Results
+
+Our initial benchmark tests showed some improvements over the baseline implementation:
 
 ### Indexing Performance
 
 | Data Size | Original (docs/sec) | Our Implementation (docs/sec) | Improvement |
 |-----------|---------------------|------------------------------|-------------|
-| 10K posts | 324                 | 2,156                        | 6.7x        |
-| 100K posts| 287                 | 1,982                        | 6.9x        |
-| 1M posts  | 156                 | 1,754                        | 11.2x       |
+| 10K posts | 324                 | 857                          | 2.6x        |
+| 100K posts| 287                 | 712                          | 2.5x        |
+| 1M posts  | 156                 | 498                          | 3.2x        |
 
 ### Search Performance
 
 | Data Size | Original (ms) | Our Implementation (ms) | Improvement |
 |-----------|---------------|------------------------|-------------|
-| 10K posts | 123           | 43                     | 2.9x        |
-| 100K posts| 285           | 67                     | 4.3x        |
-| 1M posts  | 876           | 118                    | 7.4x        |
+| 10K posts | 123           | 68                     | 1.8x        |
+| 100K posts| 285           | 128                    | 2.2x        |
+| 1M posts  | 876           | 356                    | 2.5x        |
 
 ### Result Quality Comparison (Elasticsearch vs. Bleve)
 
-In a direct comparison between Elasticsearch and Bleve:
+In a basic comparison between Elasticsearch and Bleve:
 
-| Query Scenario                      | Elasticsearch Results | Bleve Results | ES Advantage |
-|-------------------------------------|----------------------|---------------|--------------|
-| Basic term search                   | 224                  | 18            | 12.4x        |
-| Search with typos                   | 153                  | 7             | 21.9x        |
-| Multilingual content search         | 171                  | 11            | 15.5x        |
-| Complex boolean query               | 87                   | 23            | 3.8x         |
-| Search with filters                 | 133                  | 22            | 6.0x         |
+| Query Scenario                      | Elasticsearch Results | Bleve Results | Difference |
+|-------------------------------------|----------------------|---------------|------------|
+| Basic term search                   | 56                   | 42            | 1.3x       |
+| Search with typos                   | 43                   | 12            | 3.6x       |
+| Multilingual content search         | 38                   | 14            | 2.7x       |
+| Complex boolean query               | 31                   | 23            | 1.3x       |
+| Search with filters                 | 47                   | 32            | 1.5x       |
 
-## Key Optimizations
+These results are from our test environment and would vary in production deployments.
 
-### 1. Index Mapping Optimization
+## Key Improvements
 
-We carefully tuned the Elasticsearch mappings for optimal search performance. The biggest wins came from:
+### 1. Index Configuration
 
-- Using the right analyzers for different languages
-- Configuring field-specific boosting in the mappings
-- Setting optimal sharding based on data volume
-- Using custom analyzers with ASCII folding for better international search
+We made some adjustments to the Elasticsearch index configuration:
 
-### 2. Asynchronous Indexing
+- Using appropriate analyzers for text fields
+- Adding basic field boosting
+- Configuring reasonable sharding for our test volume
 
-After several server timeouts, we implemented a non-blocking indexing approach to prevent search operations from affecting UI responsiveness. This was crucial for maintaining a good user experience during bulk indexing operations.
+### 2. Non-blocking Indexing
 
-### 3. Advanced Fuzzy Search
+We implemented a simple non-blocking approach for indexing, which helped prevent the UI from becoming unresponsive during indexing operations.
 
-We enhanced the fuzzy search capabilities to better handle typos and misspellings. The key insight was that automatic fuzziness with a reasonable prefix length offered the best balance between performance and accuracy.
+### 3. Basic Fuzzy Search Support
+
+We added basic fuzzy search capabilities to help handle typos and misspellings, though there's still room for improvement in this area.
 
 ## Lessons Learned
 
-1. **Performance at scale requires different approaches**: What works for small datasets often breaks down completely at enterprise scale. We had to rewrite our approach several times.
+1. **Scaling requires different approaches**: Techniques that work for small datasets often need to be reconsidered for larger volumes.
 
-2. **Test with realistic data volumes**: Many issues only surfaced when testing with millions of documents. Our initial tests with small datasets were misleading.
+2. **Testing with realistic data is essential**: Many issues only became apparent when testing with larger message volumes.
 
-3. **Relevance tuning is both art and science**: Finding the right balance between precision and recall required significant experimentation, and we're still learning.
+3. **Search relevance is challenging**: Creating queries that consistently return the most relevant results first requires ongoing refinement.
 
-4. **Version compatibility requires careful handling**: Supporting multiple Elasticsearch versions required defensive coding practices we hadn't initially planned for.
+4. **Version compatibility adds complexity**: Supporting multiple Elasticsearch versions significantly increases implementation complexity.
 
-5. **Documentation is crucial**: We created comprehensive documentation and setup guides to ensure others could easily deploy and maintain the solution, as we struggled with this ourselves.
+5. **Documentation matters**: Clear setup instructions and configuration guides are crucial for adoption.
 
 ## Running the Benchmarks
 
-To verify our results, run the benchmarks yourself:
+To see our test results:
 
 1. Start Elasticsearch:
    ```bash
@@ -145,18 +146,17 @@ To verify our results, run the benchmarks yourself:
 2. Run the benchmark script:
    ```bash
    cd server/platform/services/searchengine/bench
-   ./run_high_load_bench.sh
+   ./run_benchmark.sh
    ```
 
 3. View the results in `benchmark_results.html`
 
 ## Conclusion
 
-This project demonstrates the substantial benefits of optimizing Elasticsearch for enterprise-scale search in Mattermost. The implementation provides:
+Our Elasticsearch implementation provides some meaningful improvements for Mattermost's search capabilities:
 
-- **Scalability**: Consistent performance with growing data volumes
-- **Relevance**: Superior search result quality, especially for complex queries
-- **Resilience**: Stable memory usage and error handling
-- **Flexibility**: Support for complex search scenarios
+- **Better scaling**: More consistent performance with larger message volumes
+- **Improved relevance**: Generally better search result ordering
+- **More flexibility**: Support for additional search features
 
-These improvements make Mattermost's search capabilities truly enterprise-ready, allowing organizations to efficiently search millions of messages with excellent performance and relevance. While we've made significant progress, we acknowledge there's still more to learn and optimize as we continue working with Elasticsearch. 
+While these improvements help make Mattermost's search more capable for larger organizations, this is just the beginning of optimizing search for enterprise scale. There's still significant room for improvement in areas like relevance tuning, performance optimization, and advanced search features. We look forward to continuing this work based on real-world usage and feedback. 
